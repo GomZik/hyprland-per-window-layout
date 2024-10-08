@@ -1,156 +1,23 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/textproto"
 	"os"
-	"os/exec"
-	"os/user"
-	"strconv"
-	"strings"
+	"perwindowlayout/hypr"
 	"time"
 )
 
-type Event struct {
-	name string
-	args []string
-}
-
-type Keyboard struct {
-	Layout       string `json:"layout"`
-	ActiveKeymap string `json:"active_keymap"`
-	Main         bool   `json:"main"`
-}
-
-type DevicesResponse struct {
-	Keyboards []Keyboard `json:"keyboards"`
-}
-
-func activateLayout(layoutIdx int) error {
-	cmd := exec.Command("hyprctl", "switchxkblayout", "all", strconv.Itoa(layoutIdx))
-	return cmd.Run()
-}
-
-func readLayouts() ([]string, error) {
-	slog.Debug("Gathering layouts with Names")
-	cmd := exec.Command("hyprctl", "devices", "-j")
-	out, err := cmd.Output()
+func processHyprlandEvents(resetRetryCount func()) error {
+	client, clientClose, err := hypr.NewClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute hyprctl: %w", err)
+		return fmt.Errorf("could not connect to the hyprland socket: %w", err)
 	}
-	var response DevicesResponse
-	if err := json.Unmarshal(out, &response); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal hyprctl response: %w", err)
-	}
-	mainKb := response.Keyboards[0]
-	for _, kb := range response.Keyboards {
-		if kb.Main {
-			mainKb = kb
-			break
-		}
-	}
-	layoutsShorts := strings.Split(mainKb.Layout, ",")
-	result := make([]string, len(layoutsShorts))
-	activeLayoutIdx := -1
-	for i, l := range layoutsShorts {
-		cmd := exec.Command("hyprctl", "switchxkblayout", "all", strconv.Itoa(i))
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("failed to switch to layout %s: %w", l, err)
-		}
-		cmd = exec.Command("hyprctl", "devices", "-j")
-		out, err := cmd.Output()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read layout %s full name: %w", l, err)
-		}
-		var response DevicesResponse
-		if err := json.Unmarshal(out, &response); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal devices info while fetching layout %s name: %w", l, err)
-		}
-		for _, kb := range response.Keyboards {
-			if kb.Main {
-				if kb.ActiveKeymap == mainKb.ActiveKeymap {
-					activeLayoutIdx = i
-				}
-				result[i] = kb.ActiveKeymap
-				break
-			}
-		}
-	}
-	if activeLayoutIdx == -1 {
-		// Just ignore that case?
-		slog.Warn("Before gathering information there was strange layout activated. Can't restore it")
-		return result, nil
-	}
-	if err := activateLayout(activeLayoutIdx); err != nil {
-		return nil, fmt.Errorf("failed to activate back layout that used before gathering: %w", err)
-	}
-	return result, nil
-}
+	defer clientClose()
 
-type HyprlandSocket struct {
-	reader *textproto.Reader
-}
-
-func (hs *HyprlandSocket) Connect() error {
-	sign, exists := os.LookupEnv("HYPRLAND_INSTANCE_SIGNATURE")
-	if !exists {
-		return fmt.Errorf("do you have Hyprland instance launched?")
-	}
-	currentUser, err := user.Current()
+	layouts, err := client.ReadLayouts()
 	if err != nil {
-		return fmt.Errorf("don't know who are you: %w", err)
-	}
-
-	socketPath := fmt.Sprintf("/run/user/%s/hypr/%s/.socket2.sock", currentUser.Uid, sign)
-	sock, err := net.Dial("unix", socketPath)
-	if err != nil {
-		return fmt.Errorf("can't connect to Hyprland event socket: %w.", err)
-	}
-
-	hs.reader = textproto.NewReader(bufio.NewReader(sock))
-	return nil
-}
-
-func (hs *HyprlandSocket) ReadEvent() (Event, error) {
-	data, err := hs.reader.ReadLine()
-	if err != nil {
-		return Event{}, fmt.Errorf("failed to read from socket2.sock: %w", err)
-	}
-	evtParts := strings.Split(data, ">>")
-	if len(evtParts) == 0 {
-		return Event{}, fmt.Errorf("got event, but the format is unexpected")
-	}
-	evt := Event{
-		name: evtParts[0],
-		args: strings.Split(evtParts[1], ","),
-	}
-	return evt, nil
-}
-
-func main() {
-	logfile, err := os.OpenFile(os.ExpandEnv("$HOME/.per-window-layout.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0655)
-	if err != nil {
-		panic(fmt.Errorf("Could not open logfile: %w", err))
-	}
-	h := slog.NewTextHandler(logfile, &slog.HandlerOptions{Level: slog.LevelDebug})
-	slog.SetDefault(slog.New(h))
-
-	hs := HyprlandSocket{}
-	if err := hs.Connect(); err != nil {
-		err = fmt.Errorf("Could not connect to the hyprland socket: %w", err)
-		slog.Error(err.Error())
-		panic(err)
-	}
-
-	layouts, err := readLayouts()
-	if err != nil {
-		err = fmt.Errorf("Could not detect layouts: %w", err)
-		slog.Error(err.Error())
-		panic(err)
+		return fmt.Errorf("could not detect layouts: %w", err)
 	}
 	slog.Debug(fmt.Sprintf("Layouts: %v", layouts))
 	layoutToIndex := make(map[string]int)
@@ -164,50 +31,65 @@ func main() {
 	currentWindowId := ""
 	currentLayout := -1
 
-	retry := 0
 	for {
-		if retry > 3 {
-			err = fmt.Errorf("Failed to reconnect after %d attempts", retry)
-			slog.Error(err.Error())
-			panic(err)
-
-		}
-		if retry > 0 {
-			<-time.After(time.Duration(retry) * time.Second)
-		}
-		evt, err := hs.ReadEvent()
+		evt, err := client.ReadEvent()
 		if err != nil {
-			retry += 1
-			if err := hs.Connect(); err != nil {
-				err = fmt.Errorf("Failed to reconnect to the socket when error is acquired while reading: %w", err)
-				slog.Error(err.Error(), "Retry", retry)
-			}
-			continue
+			return fmt.Errorf("failed to read hyprland event: %w", err)
 		}
-		retry = 0
-		switch evt.name {
+		resetRetryCount()
+		switch evt.Name {
 		case "activelayout":
 			{
-				currentLayout = layoutToIndex[evt.args[len(evt.args)-1]]
 				if currentWindowId == "" {
 					continue
 				}
+				currentLayout = layoutToIndex[evt.Args[len(evt.Args)-1]]
 				layoutMap[currentWindowId] = currentLayout
 			}
 		case "activewindowv2":
 			{
-				currentWindowId = evt.args[len(evt.args)-1]
+				currentWindowId = evt.Args[len(evt.Args)-1]
 				windowLayout, known := layoutMap[currentWindowId]
 				if !known {
 					windowLayout = defaultLayout
 				}
-				err := activateLayout(windowLayout)
+				err := client.SwitchXKBLayout(windowLayout)
 				if err != nil {
-					err = fmt.Errorf("Failed to activate layout: %w", err)
-					slog.Error(err.Error())
-					panic(err)
+					return fmt.Errorf("failed to activate layout: %w", err)
 				}
 			}
+		}
+	}
+
+}
+
+func main() {
+	logfile, err := os.OpenFile(os.ExpandEnv("$HOME/.per-window-layout.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0655)
+	if err != nil {
+		panic(fmt.Errorf("Could not open logfile: %w", err))
+	}
+	h := slog.NewTextHandler(logfile, &slog.HandlerOptions{Level: slog.LevelDebug})
+	slog.SetDefault(slog.New(h))
+
+	retry := 0
+	retryWait := []time.Duration{
+		500 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+	}
+	resetRetry := func() {
+		retry = 0
+	}
+	for {
+		if err := processHyprlandEvents(resetRetry); err != nil {
+			slog.Error(err.Error())
+			if retry >= len(retryWait) {
+				panic(err)
+			}
+			slog.Info(fmt.Sprintf("Waiting %s for recover", retryWait[retry]), "retry", retry)
+			<-time.After(retryWait[retry])
+			retry += 1
 		}
 	}
 }
