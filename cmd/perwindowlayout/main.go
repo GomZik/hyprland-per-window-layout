@@ -48,10 +48,17 @@ func processHyprlandEvents(resetRetryCount func()) error {
 			}
 		case "activewindowv2":
 			{
-				currentWindowId = evt.Args[len(evt.Args)-1]
+				newWindowId := evt.Args[len(evt.Args)-1]
+				if currentWindowId == newWindowId {
+					continue
+				}
+				currentWindowId = newWindowId
 				windowLayout, known := layoutMap[currentWindowId]
 				if !known {
 					windowLayout = defaultLayout
+				}
+				if windowLayout == currentLayout {
+					continue
 				}
 				err := client.SwitchXKBLayout(windowLayout)
 				if err != nil {
